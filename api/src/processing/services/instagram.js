@@ -4,6 +4,36 @@ import { genericUserAgent } from "../../config.js";
 import { createStream } from "../../stream/manage.js";
 import { getCookie, updateCookie } from "../cookie/manager.js";
 
+// accounts instagram answered checkpoint/challenge/login_required for.
+// keyed by cookie pool index, value is the timestamp until which we skip it.
+// hitting a flagged account again only wastes a request and adds to the
+// suspicious-traffic pattern that gets the rest of the pool flagged.
+const flaggedAccounts = new Map();
+const FLAGGED_TTL = 30 * 60 * 1000;
+
+const isFlagged = (cookie) => (flaggedAccounts.get(cookie?.meta?.idx) || 0) > Date.now();
+
+const markFlagged = (cookie, reason, ttl = FLAGGED_TTL) => {
+    const idx = cookie?.meta?.idx;
+    if (idx === undefined || isFlagged(cookie)) return;
+    flaggedAccounts.set(idx, Date.now() + ttl);
+    console.warn(`[instagram] account #${idx + 1} flagged (${reason}), skipping it for ${ttl / 60000} min`);
+}
+
+// random pool account that isn't flagged and wasn't tried yet.
+// falls back to a flagged one only when nothing else is left.
+const getHealthyCookie = (exclude = new Set()) => {
+    let fallback;
+    for (let i = 0; i < 40; i++) {
+        const cookie = getCookie('instagram');
+        if (!cookie) return;
+        if (exclude.has(cookie)) continue;
+        if (!isFlagged(cookie)) return cookie;
+        fallback ??= cookie;
+    }
+    return fallback;
+}
+
 const commonHeaders = {
     "user-agent": genericUserAgent,
     "sec-gpc": "1",
@@ -133,6 +163,56 @@ export default function instagram(obj) {
         }).then(r => r.json()).catch(() => {});
 
         return mediaInfo?.items?.[0];
+    }
+
+    // shortcode -> numeric media pk, used when oembed refuses to give us a media_id
+    function shortcodeToMediaId(id) {
+        const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+        let n = 0n;
+        for (const ch of id.slice(0, 11)) {
+            const i = alphabet.indexOf(ch);
+            if (i < 0) return;
+            n = n * 64n + BigInt(i);
+        }
+        return n.toString();
+    }
+
+    // web api accepts web session cookies; the mobile api rejects them with challenge_required.
+    // works for posts, reels and stories (story pk from the url is a valid media id).
+    // if the picked account is flagged by instagram (checkpoint/challenge/login required),
+    // retry with a couple of other accounts from the cookie pool.
+    const blockedSessionErrors = ['checkpoint_required', 'challenge_required', 'login_required'];
+
+    async function requestWebApi(mediaId, cookie, attempts = 4) {
+        const tried = new Set();
+        for (let i = 0; i < attempts && cookie; i++) {
+            tried.add(cookie);
+            const mediaInfo = await request(
+                `https://www.instagram.com/api/v1/media/${mediaId}/info/`,
+                cookie
+            ).catch(() => {});
+
+            const item = mediaInfo?.items?.[0];
+            if (item) return item;
+
+            // a dead/flagged session shows up as a json error message, or as an
+            // html login/challenge page instead of json (request() throws -> undefined).
+            // a rate limited one says "please wait a few minutes".
+            if (!mediaInfo) {
+                markFlagged(cookie, 'non-json response');
+            } else if (blockedSessionErrors.includes(mediaInfo.message)) {
+                markFlagged(cookie, mediaInfo.message);
+            } else if (/wait a few minutes/i.test(mediaInfo.message)) {
+                markFlagged(cookie, 'rate limited', 5 * 60 * 1000);
+            } else {
+                // a real answer about the media (not found, private, etc.)
+                return;
+            }
+
+            const next = getHealthyCookie(tried);
+            if (!next || isFlagged(next)) return;
+            cookie = next;
+        }
     }
 
     async function requestHTML(id, cookie) {
@@ -415,11 +495,10 @@ export default function instagram(obj) {
 
     async function getPost(id, alwaysProxy) {
         const hasData = (data) => data
-                                    && data.gql_data !== null
-                                    && data?.gql_data?.xdt_shortcode_media !== null;
+                                    && (!('gql_data' in data) || !!(data.gql_data?.shortcode_media || data.gql_data?.xdt_shortcode_media));
         let data, result;
         try {
-            const cookie = getCookie('instagram');
+            const cookie = getHealthyCookie();
 
             const bearer = getCookie('instagram_bearer');
             const token = bearer?.values()?.token;
@@ -435,6 +514,11 @@ export default function instagram(obj) {
             // mobile api (no cookie, cookie)
             if (media_id && !hasData(data)) data = await requestMobileApi(media_id);
             if (media_id && cookie && !hasData(data)) data = await requestMobileApi(media_id, { cookie });
+
+            // web api (cookie), in case the mobile api rejects the cookie session
+            if (cookie && !hasData(data)) {
+                data = await requestWebApi(media_id || shortcodeToMediaId(id), cookie);
+            }
 
             // html embed (no cookie, cookie)
             if (!hasData(data)) data = await requestHTML(id);
@@ -470,8 +554,17 @@ export default function instagram(obj) {
     }
 
     async function getStory(username, id) {
-        const cookie = getCookie('instagram');
+        const cookie = getHealthyCookie();
         if (!cookie) return { error: "link.unsupported" };
+
+        // fast path: the story id is the media pk, so the web media info endpoint
+        // returns it directly without a username -> user id lookup
+        // (web_profile_info is heavily rate limited and often answers 429)
+        const webItem = /^\d+$/.test(id) && await requestWebApi(id, cookie);
+        if (webItem) {
+            const storyResult = extractStoryItem(webItem, id);
+            if (storyResult) return storyResult;
+        }
 
         const userId = await usernameToId(username, cookie);
         if (!userId) return { error: "fetch.empty" };
@@ -495,9 +588,13 @@ export default function instagram(obj) {
             media = data?.data?.xdt_api__v1__feed__reels_media?.reels_media?.find(m => m.id === userId);
         } catch {}
 
-        const item = media.items.find(m => m.pk === id);
+        const item = media?.items?.find(m => m.pk === id);
         if (!item) return { error: "fetch.empty" };
 
+        return extractStoryItem(item, id) || { error: "link.unsupported" };
+    }
+
+    function extractStoryItem(item, id) {
         if (item.video_versions) {
             const video = item.video_versions.reduce((a, b) => a.width * a.height < b.width * b.height ? b : a)
             return {
@@ -514,8 +611,6 @@ export default function instagram(obj) {
                 filename: `instagram_${id}.jpg`,
             }
         }
-
-        return { error: "link.unsupported" };
     }
 
     const { postId, shareId, storyId, username, alwaysProxy } = obj;
