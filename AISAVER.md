@@ -16,7 +16,20 @@ This fork changes three things in `api/src/processing/services/instagram.js`:
 
 Related upstream work: [imputnet/cobalt#1619](https://github.com/imputnet/cobalt/pull/1619) covers the web API fallback for some cases. This fork also includes the shortcode-to-media-id path and the `hasData` fix.
 
-Verified locally on Cobalt 11.7.1 (upstream `a636575`): 224 of 235 public Instagram reels and posts succeeded (95%). Stories use a different route and are not covered by this patch.
+Verified locally on Cobalt 11.7.1 (upstream `a636575`): 224 of 235 public Instagram reels and posts succeeded (95%).
+
+### Stories
+
+Root cause: Cobalt's story route first resolves the username to a user id through `www.instagram.com/api/v1/users/web_profile_info/`. With our session cookies that endpoint answers `429` with an empty body on every request, so `getStory` stopped with `fetch.empty` before it ever asked for the story. When the lookup did succeed, a missing `reels_media` reply crashed on `media.items` and also surfaced as `fetch.empty`.
+
+The fork adds two things:
+
+4. A story fast path. The number in `/stories/<username>/<id>` is the story's media pk, and `www.instagram.com/api/v1/media/<id>/info/` with web cookies, `x-ig-app-id: 936619743392459` and `x-csrftoken` returns the story item directly. No username lookup is needed. The old `web_profile_info` + GraphQL `reels_media` route stays as a fallback and no longer crashes when it gets no reply.
+5. Account rotation on flagged sessions. If the web media endpoint answers `checkpoint_required`, `challenge_required` or `login_required`, the request is retried with up to two other accounts from the cookie pool. This applies to posts, reels and stories.
+
+Expired stories (older than 24 hours) and stories from private accounts the session cannot see return `Media not found or unavailable` from Instagram. Cobalt still reports those as `fetch.empty`.
+
+Keep the cookie pool healthy: an account that returns `checkpoint_required` needs to be verified in a browser by its owner or removed from `cookies.json`.
 
 ## Syncing from upstream
 
@@ -25,7 +38,7 @@ git remote add upstream https://github.com/imputnet/cobalt.git   # once
 git fetch upstream
 git checkout aisaver/instagram-fix
 git rebase upstream/main
-# If instagram.js conflicts, keep the web API fallback, shortcode helper, and hasData fix, then:
+# If instagram.js conflicts, keep the web API fallback with account rotation, shortcode helper, hasData fix, and story fast path, then:
 git push --force-with-lease origin aisaver/instagram-fix
 ```
 

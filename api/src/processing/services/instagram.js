@@ -147,14 +147,32 @@ export default function instagram(obj) {
         return n.toString();
     }
 
-    // web api accepts web session cookies; the mobile api rejects them with challenge_required
-    async function requestWebApi(mediaId, cookie) {
-        const mediaInfo = await request(
-            `https://www.instagram.com/api/v1/media/${mediaId}/info/`,
-            cookie
-        ).catch(() => {});
+    // web api accepts web session cookies; the mobile api rejects them with challenge_required.
+    // works for posts, reels and stories (story pk from the url is a valid media id).
+    // if the picked account is flagged by instagram (checkpoint/challenge/login required),
+    // retry with a couple of other accounts from the cookie pool.
+    const blockedSessionErrors = ['checkpoint_required', 'challenge_required', 'login_required'];
 
-        return mediaInfo?.items?.[0];
+    async function requestWebApi(mediaId, cookie, attempts = 3) {
+        const tried = new Set();
+        for (let i = 0; i < attempts && cookie; i++) {
+            tried.add(cookie);
+            const mediaInfo = await request(
+                `https://www.instagram.com/api/v1/media/${mediaId}/info/`,
+                cookie
+            ).catch(() => {});
+
+            const item = mediaInfo?.items?.[0];
+            if (item) return item;
+            if (!blockedSessionErrors.includes(mediaInfo?.message)) return;
+
+            let next;
+            for (let j = 0; j < 5 && (!next || tried.has(next)); j++) {
+                next = getCookie('instagram');
+            }
+            if (!next || tried.has(next)) return;
+            cookie = next;
+        }
     }
 
     async function requestHTML(id, cookie) {
@@ -499,6 +517,15 @@ export default function instagram(obj) {
         const cookie = getCookie('instagram');
         if (!cookie) return { error: "link.unsupported" };
 
+        // fast path: the story id is the media pk, so the web media info endpoint
+        // returns it directly without a username -> user id lookup
+        // (web_profile_info is heavily rate limited and often answers 429)
+        const webItem = /^\d+$/.test(id) && await requestWebApi(id, cookie);
+        if (webItem) {
+            const storyResult = extractStoryItem(webItem, id);
+            if (storyResult) return storyResult;
+        }
+
         const userId = await usernameToId(username, cookie);
         if (!userId) return { error: "fetch.empty" };
 
@@ -521,9 +548,13 @@ export default function instagram(obj) {
             media = data?.data?.xdt_api__v1__feed__reels_media?.reels_media?.find(m => m.id === userId);
         } catch {}
 
-        const item = media.items.find(m => m.pk === id);
+        const item = media?.items?.find(m => m.pk === id);
         if (!item) return { error: "fetch.empty" };
 
+        return extractStoryItem(item, id) || { error: "link.unsupported" };
+    }
+
+    function extractStoryItem(item, id) {
         if (item.video_versions) {
             const video = item.video_versions.reduce((a, b) => a.width * a.height < b.width * b.height ? b : a)
             return {
@@ -540,8 +571,6 @@ export default function instagram(obj) {
                 filename: `instagram_${id}.jpg`,
             }
         }
-
-        return { error: "link.unsupported" };
     }
 
     const { postId, shareId, storyId, username, alwaysProxy } = obj;
