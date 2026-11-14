@@ -135,6 +135,28 @@ export default function instagram(obj) {
         return mediaInfo?.items?.[0];
     }
 
+    // shortcode -> numeric media pk, used when oembed refuses to give us a media_id
+    function shortcodeToMediaId(id) {
+        const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+        let n = 0n;
+        for (const ch of id.slice(0, 11)) {
+            const i = alphabet.indexOf(ch);
+            if (i < 0) return;
+            n = n * 64n + BigInt(i);
+        }
+        return n.toString();
+    }
+
+    // web api accepts web session cookies; the mobile api rejects them with challenge_required
+    async function requestWebApi(mediaId, cookie) {
+        const mediaInfo = await request(
+            `https://www.instagram.com/api/v1/media/${mediaId}/info/`,
+            cookie
+        ).catch(() => {});
+
+        return mediaInfo?.items?.[0];
+    }
+
     async function requestHTML(id, cookie) {
         const data = await fetch(`https://www.instagram.com/p/${id}/embed/captioned/`, {
             headers: {
@@ -415,8 +437,7 @@ export default function instagram(obj) {
 
     async function getPost(id, alwaysProxy) {
         const hasData = (data) => data
-                                    && data.gql_data !== null
-                                    && data?.gql_data?.xdt_shortcode_media !== null;
+                                    && (!('gql_data' in data) || !!(data.gql_data?.shortcode_media || data.gql_data?.xdt_shortcode_media));
         let data, result;
         try {
             const cookie = getCookie('instagram');
@@ -435,6 +456,11 @@ export default function instagram(obj) {
             // mobile api (no cookie, cookie)
             if (media_id && !hasData(data)) data = await requestMobileApi(media_id);
             if (media_id && cookie && !hasData(data)) data = await requestMobileApi(media_id, { cookie });
+
+            // web api (cookie), in case the mobile api rejects the cookie session
+            if (cookie && !hasData(data)) {
+                data = await requestWebApi(media_id || shortcodeToMediaId(id), cookie);
+            }
 
             // html embed (no cookie, cookie)
             if (!hasData(data)) data = await requestHTML(id);
