@@ -4,6 +4,36 @@ import { genericUserAgent } from "../../config.js";
 import { createStream } from "../../stream/manage.js";
 import { getCookie, updateCookie } from "../cookie/manager.js";
 
+// accounts instagram answered checkpoint/challenge/login_required for.
+// keyed by cookie pool index, value is the timestamp until which we skip it.
+// hitting a flagged account again only wastes a request and adds to the
+// suspicious-traffic pattern that gets the rest of the pool flagged.
+const flaggedAccounts = new Map();
+const FLAGGED_TTL = 30 * 60 * 1000;
+
+const isFlagged = (cookie) => (flaggedAccounts.get(cookie?.meta?.idx) || 0) > Date.now();
+
+const markFlagged = (cookie, reason, ttl = FLAGGED_TTL) => {
+    const idx = cookie?.meta?.idx;
+    if (idx === undefined || isFlagged(cookie)) return;
+    flaggedAccounts.set(idx, Date.now() + ttl);
+    console.warn(`[instagram] account #${idx + 1} flagged (${reason}), skipping it for ${ttl / 60000} min`);
+}
+
+// random pool account that isn't flagged and wasn't tried yet.
+// falls back to a flagged one only when nothing else is left.
+const getHealthyCookie = (exclude = new Set()) => {
+    let fallback;
+    for (let i = 0; i < 40; i++) {
+        const cookie = getCookie('instagram');
+        if (!cookie) return;
+        if (exclude.has(cookie)) continue;
+        if (!isFlagged(cookie)) return cookie;
+        fallback ??= cookie;
+    }
+    return fallback;
+}
+
 const commonHeaders = {
     "user-agent": genericUserAgent,
     "sec-gpc": "1",
@@ -153,7 +183,7 @@ export default function instagram(obj) {
     // retry with a couple of other accounts from the cookie pool.
     const blockedSessionErrors = ['checkpoint_required', 'challenge_required', 'login_required'];
 
-    async function requestWebApi(mediaId, cookie, attempts = 3) {
+    async function requestWebApi(mediaId, cookie, attempts = 4) {
         const tried = new Set();
         for (let i = 0; i < attempts && cookie; i++) {
             tried.add(cookie);
@@ -164,13 +194,23 @@ export default function instagram(obj) {
 
             const item = mediaInfo?.items?.[0];
             if (item) return item;
-            if (!blockedSessionErrors.includes(mediaInfo?.message)) return;
 
-            let next;
-            for (let j = 0; j < 5 && (!next || tried.has(next)); j++) {
-                next = getCookie('instagram');
+            // a dead/flagged session shows up as a json error message, or as an
+            // html login/challenge page instead of json (request() throws -> undefined).
+            // a rate limited one says "please wait a few minutes".
+            if (!mediaInfo) {
+                markFlagged(cookie, 'non-json response');
+            } else if (blockedSessionErrors.includes(mediaInfo.message)) {
+                markFlagged(cookie, mediaInfo.message);
+            } else if (/wait a few minutes/i.test(mediaInfo.message)) {
+                markFlagged(cookie, 'rate limited', 5 * 60 * 1000);
+            } else {
+                // a real answer about the media (not found, private, etc.)
+                return;
             }
-            if (!next || tried.has(next)) return;
+
+            const next = getHealthyCookie(tried);
+            if (!next || isFlagged(next)) return;
             cookie = next;
         }
     }
@@ -458,7 +498,7 @@ export default function instagram(obj) {
                                     && (!('gql_data' in data) || !!(data.gql_data?.shortcode_media || data.gql_data?.xdt_shortcode_media));
         let data, result;
         try {
-            const cookie = getCookie('instagram');
+            const cookie = getHealthyCookie();
 
             const bearer = getCookie('instagram_bearer');
             const token = bearer?.values()?.token;
@@ -514,7 +554,7 @@ export default function instagram(obj) {
     }
 
     async function getStory(username, id) {
-        const cookie = getCookie('instagram');
+        const cookie = getHealthyCookie();
         if (!cookie) return { error: "link.unsupported" };
 
         // fast path: the story id is the media pk, so the web media info endpoint
